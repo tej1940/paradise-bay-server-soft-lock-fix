@@ -9,6 +9,6 @@ func main() {
 	}
 	defer store.db.Close()
 
-	go StartHttp(3300)
+	go StartHttp(3300, store)
 	StartSocket(3301, store)
 }

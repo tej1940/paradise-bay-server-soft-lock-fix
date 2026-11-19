@@ -32,3 +32,13 @@ If you have any issues while installing or playing the game don't hesitate to [o
 ### Starting the server
 
 You need to install [Go](https://go.dev/dl/) to run it. Then, run `start.bat`.
+
+### Managing player saves
+
+With the server running, open [http://127.0.0.1:3300/admin](http://127.0.0.1:3300/admin) on the same computer. Select a player to view saved fragments, change their alias or link a new device ID (`z2did`), and download or restore a JSON backup. Restoring replaces the player's profile and saved fragments.
+
+After reinstalling, if the game creates a new `Guest` account, stop the game first. Copy the new account's `z2did` from the player list, delete that temporary account in the panel, then select the old account and save the copied `z2did`. Download a backup before deleting an account: deletion removes its profile, fragments, and transaction history.
+
+The server automatically skips the final seal-house dive tutorial missions for existing and new players. If the game is already open during the first server restart after updating, restart the game to load the updated mission progress. The selected player's panel also has a **Débloquer la caméra (sauter le tutoriel)** action; download a backup and stop the game before using it manually.
+
+The admin panel and its API are available only from the same computer. The game HTTP endpoints continue to use their existing network binding.

@@ -7,3 +7,5 @@
 
 # Game package (downloaded separately, not part of the repo)
 *.Appx
+*.appx
+/AppxPackageExtracted/

@@ -8,8 +8,10 @@ import (
 	"net/http"
 )
 
-func StartHttp(port int) {
+func StartHttp(port int, store *Store) {
 	mux := http.NewServeMux()
+
+	registerAdminRoutes(mux, store)
 
 	mux.HandleFunc("/api/game_servers/available", func(w http.ResponseWriter, r *http.Request) {
 		servers := []map[string]interface{}{
@@ -51,6 +53,9 @@ func StartHttp(port int) {
 		}
 	})
 
-	fmt.Printf("✓ HTTP Server started on 127.0.0.1:%d\n", port)
-	http.ListenAndServe(fmt.Sprintf(":%d", port), mux)
+	addr := fmt.Sprintf(":%d", port)
+	fmt.Printf("✓ HTTP Server started on port %d (admin panel: http://127.0.0.1:%d/admin)\n", port, port)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("HTTP server stopped: %v", err)
+	}
 }

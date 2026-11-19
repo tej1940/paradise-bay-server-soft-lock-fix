@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -17,6 +18,12 @@ import (
 // Store wraps the Bun database and provides game-data access methods.
 type Store struct {
 	db *bun.DB
+}
+
+var diveTutorialMissionIDs = []string{
+	"mission_angelfish_dive_update_tutorial_2a",
+	"mission_angelfish_dive_update_tutorial_3",
+	"mission_angelfish_dive_update_tutorial_4",
 }
 
 // Player holds the data for the single player account.
@@ -176,6 +183,16 @@ func (s *Store) seed(ctx context.Context) error {
 		}
 	}
 
+	var players []Player
+	if err = s.db.NewSelect().Model(&players).Column("uuid").Scan(ctx); err != nil {
+		return err
+	}
+	for _, player := range players {
+		if err = s.SkipDiveTutorial(player.UUID); err != nil {
+			return fmt.Errorf("skip dive tutorial for player %s: %w", player.UUID, err)
+		}
+	}
+
 	return nil
 }
 
@@ -247,6 +264,262 @@ func (s *Store) GetPlayerByZ2DID(z2did string) (Player, error) {
 	return p, err
 }
 
+// ListPlayers returns all players ordered by alias and UUID.
+func (s *Store) ListPlayers() ([]Player, error) {
+	var players []Player
+	err := s.db.NewSelect().Model(&players).Order("alias ASC").Order("uuid ASC").Scan(context.Background())
+	return players, err
+}
+
+// SetPlayerIdentity updates the alias and device ID without changing the player's save.
+func (s *Store) SetPlayerIdentity(uuid, alias, z2did string) error {
+	ctx := context.Background()
+	if z2did != "" {
+		count, err := s.db.NewSelect().Model((*Player)(nil)).
+			Where("z2did = ?", z2did).
+			Where("uuid != ?", uuid).
+			Count(ctx)
+		if err != nil {
+			return err
+		}
+		if count != 0 {
+			return errDeviceIDAlreadyLinked
+		}
+	}
+
+	result, err := s.db.NewUpdate().
+		Model((*Player)(nil)).
+		Set("alias = ?", alias).
+		Set("z2did = ?", z2did).
+		Where("uuid = ?", uuid).
+		Exec(ctx)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// GetPlayerFragments returns fragments whose keys contain the player's UUID.
+func (s *Store) GetPlayerFragments(uuid string) ([]DocumentFragment, error) {
+	fragments := make([]DocumentFragment, 0)
+	err := s.db.NewSelect().Model(&fragments).
+		Where("instr(key, ?) > 0", uuid).
+		Order("key ASC").
+		Scan(context.Background())
+	return fragments, err
+}
+
+// ReplacePlayerSave atomically replaces a player's profile and all fragments in their backup.
+func (s *Store) ReplacePlayerSave(player Player, fragments []DocumentFragment) error {
+	ctx := context.Background()
+	return s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		result, err := tx.NewUpdate().
+			Model(&player).
+			Column("alias", "nanopods", "gems", "lifetime_value_dollars", "leaderboard_tier", "game_alias", "current_tc_id", "z2did").
+			WherePK().
+			Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return err
+		} else if affected == 0 {
+			return sql.ErrNoRows
+		}
+
+		if _, err := tx.NewDelete().Model((*DocumentFragment)(nil)).
+			Where("instr(key, ?) > 0", player.UUID).
+			Exec(ctx); err != nil {
+			return err
+		}
+		for i := range fragments {
+			if _, err := tx.NewInsert().Model(&fragments[i]).Exec(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// DeletePlayer removes a player, their saved fragments, and their transaction history atomically.
+func (s *Store) DeletePlayer(uuid string) error {
+	ctx := context.Background()
+	return s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		var player Player
+		if err := tx.NewSelect().Model(&player).Where("uuid = ?", uuid).Scan(ctx); err != nil {
+			return err
+		}
+		if _, err := tx.NewDelete().Model((*DocumentFragment)(nil)).
+			Where("instr(key, ?) > 0", uuid).
+			Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := tx.NewDelete().Model((*TransactionRecord)(nil)).
+			Where("player_uuid = ?", uuid).
+			Exec(ctx); err != nil {
+			return err
+		}
+		_, err := tx.NewDelete().Model(&player).WherePK().Exec(ctx)
+		return err
+	})
+}
+
+// SkipDiveTutorial marks the seal-house camera tutorial missions as complete.
+func (s *Store) SkipDiveTutorial(uuid string) error {
+	ctx := context.Background()
+	return s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		return s.skipDiveTutorialInTx(ctx, tx, uuid)
+	})
+}
+
+func (s *Store) skipDiveTutorialInTx(ctx context.Context, tx bun.Tx, uuid string) error {
+	var player Player
+	if err := tx.NewSelect().Model(&player).Where("uuid = ?", uuid).Scan(ctx); err != nil {
+		return err
+	}
+
+	history := DocumentFragment{Key: "TKMissions:history:P[" + uuid + "]"}
+	stateCache := DocumentFragment{Key: "TKMissions:stateCache:P[" + uuid + "]"}
+	defaultBlobs := []string{
+		`{"_t":"TKMissionHistoryFragment:v1"}`,
+		`{"_t":"TKMissionCacheFragment:v1","cache":{"a":{},"c":{},"p":{},"s":[],"v":[]}}`,
+	}
+	fragments := []*DocumentFragment{&history, &stateCache}
+	for i, fragment := range fragments {
+		if err := tx.NewSelect().Model(fragment).Where("key = ?", fragment.Key).Scan(ctx); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			sum := sha256.Sum256([]byte(defaultBlobs[i]))
+			fragment.BlobJSON = defaultBlobs[i]
+			fragment.Hash = fmt.Sprintf("%x", sum)
+			fragment.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05")
+			if _, err := tx.NewInsert().Model(fragment).On("CONFLICT (key) DO NOTHING").Exec(ctx); err != nil {
+				return err
+			}
+			if err := tx.NewSelect().Model(fragment).Where("key = ?", fragment.Key).Scan(ctx); err != nil {
+				return err
+			}
+		}
+	}
+
+	var historyData map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(history.BlobJSON), &historyData); err != nil {
+		return fmt.Errorf("decode mission history: %w", err)
+	}
+	if historyData == nil {
+		return fmt.Errorf("mission history fragment has an unexpected format")
+	}
+	var historyType string
+	if err := json.Unmarshal(historyData["_t"], &historyType); err != nil {
+		return fmt.Errorf("decode mission history type: %w", err)
+	}
+	if historyType != "TKMissionHistoryFragment:v1" {
+		return fmt.Errorf("mission history fragment has an unexpected format")
+	}
+	for _, missionID := range diveTutorialMissionIDs {
+		historyData[missionID] = json.RawMessage(`"c"`)
+	}
+	historyBlob, err := json.Marshal(historyData)
+	if err != nil {
+		return fmt.Errorf("encode mission history: %w", err)
+	}
+
+	var stateData map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stateCache.BlobJSON), &stateData); err != nil {
+		return fmt.Errorf("decode mission state cache: %w", err)
+	}
+	if stateData == nil {
+		return fmt.Errorf("mission state cache fragment has an unexpected format")
+	}
+	var stateType string
+	if err := json.Unmarshal(stateData["_t"], &stateType); err != nil {
+		return fmt.Errorf("decode mission state cache type: %w", err)
+	}
+	if stateType != "TKMissionCacheFragment:v1" {
+		return fmt.Errorf("mission state cache fragment has an unexpected format")
+	}
+	var missionCaches map[string]json.RawMessage
+	if err := json.Unmarshal(stateData["cache"], &missionCaches); err != nil || missionCaches == nil {
+		return fmt.Errorf("mission state cache has an unexpected format")
+	}
+	for _, cacheName := range []string{"a", "p"} {
+		cacheBlob, ok := missionCaches[cacheName]
+		if !ok {
+			continue
+		}
+		var cache map[string]json.RawMessage
+		if err := json.Unmarshal(cacheBlob, &cache); err != nil || cache == nil {
+			return fmt.Errorf("mission cache %q has an unexpected format", cacheName)
+		}
+		for _, missionID := range diveTutorialMissionIDs {
+			delete(cache, missionID)
+		}
+		missionCaches[cacheName], err = json.Marshal(cache)
+		if err != nil {
+			return fmt.Errorf("encode mission cache %q: %w", cacheName, err)
+		}
+	}
+	completedCache, ok := missionCaches["c"]
+	if !ok {
+		missionCaches["c"] = json.RawMessage("{}")
+		completedCache = missionCaches["c"]
+	}
+	var completedMissions map[string]json.RawMessage
+	if err := json.Unmarshal(completedCache, &completedMissions); err != nil {
+		return fmt.Errorf("decode completed mission cache: %w", err)
+	}
+	if completedMissions == nil {
+		return fmt.Errorf("completed mission cache has an unexpected format")
+	}
+	for _, missionID := range diveTutorialMissionIDs {
+		completedMissions[missionID] = json.RawMessage("true")
+	}
+	missionCaches["c"], err = json.Marshal(completedMissions)
+	if err != nil {
+		return fmt.Errorf("encode completed mission cache: %w", err)
+	}
+	stateData["cache"], err = json.Marshal(missionCaches)
+	if err != nil {
+		return fmt.Errorf("encode mission state cache: %w", err)
+	}
+	stateBlob, err := json.Marshal(stateData)
+	if err != nil {
+		return fmt.Errorf("encode mission state cache fragment: %w", err)
+	}
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	updates := []struct {
+		fragment *DocumentFragment
+		blob     []byte
+	}{
+		{fragment: &history, blob: historyBlob},
+		{fragment: &stateCache, blob: stateBlob},
+	}
+	for _, update := range updates {
+		sum := sha256.Sum256(update.blob)
+		hash := fmt.Sprintf("%x", sum)
+		if update.fragment.BlobJSON == string(update.blob) && update.fragment.Hash == hash {
+			continue
+		}
+		update.fragment.BlobJSON = string(update.blob)
+		update.fragment.Hash = hash
+		update.fragment.UpdatedAt = now
+		if _, err := tx.NewUpdate().Model(update.fragment).
+			Column("blob_json", "hash", "updated_at").
+			WherePK().
+			Exec(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CreatePlayer inserts a new player row with default currency values and returns it.
 func (s *Store) CreatePlayer(uuid, alias, z2did string) (Player, error) {
 	p := Player{
@@ -258,7 +531,12 @@ func (s *Store) CreatePlayer(uuid, alias, z2did string) (Player, error) {
 		LeaderboardTier:      "Tier0",
 		Z2DID:                z2did,
 	}
-	_, err := s.db.NewInsert().Model(&p).Exec(context.Background())
+	err := s.db.RunInTx(context.Background(), nil, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := tx.NewInsert().Model(&p).Exec(ctx); err != nil {
+			return err
+		}
+		return s.skipDiveTutorialInTx(ctx, tx, p.UUID)
+	})
 	return p, err
 }
 
