@@ -421,12 +421,16 @@ func TestAdminPanelKeepsSaveManagementVisible(t *testing.T) {
 	}
 
 	html := response.Body.String()
-	saveSection := strings.Index(html, "<section><h2>Selected Player Save</h2>")
-	marketSection := strings.Index(html, "<section><h2>World Market</h2>")
-	if saveSection < 0 || marketSection < 0 || saveSection > marketSection {
-		t.Fatal("save section should appear before the market controls")
+	if !strings.Contains(html, `data-module-id="player-save"`) ||
+		!strings.Contains(html, `data-module-id="world-market"`) ||
+		!strings.Contains(html, `data-module-handle`) ||
+		!strings.Contains(html, `id="moduleOrderStatus"`) {
+		t.Fatal("admin panel is missing movable dashboard modules")
 	}
 	if !strings.Contains(html, "Download save") || !strings.Contains(html, "Restore from file") {
 		t.Fatal("admin panel is missing backup or restore controls")
+	}
+	if !strings.Contains(html, `detailsEl.querySelector(".actions").insertBefore(skipTutorial`) {
+		t.Fatal("tutorial action is not scoped to the selected player save")
 	}
 }

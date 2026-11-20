@@ -86,7 +86,7 @@ func (s *Store) setWorldSnowEnabled(enabled bool) error {
 		return fmt.Errorf("encode island composition: %w", err)
 	}
 	updated = append(updated, '\n')
-	if err := writeWorldLandComposition(compositionPath, updated); err != nil {
+	if err := writeAtomicClientFile(compositionPath, updated); err != nil {
 		return err
 	}
 	return nil
@@ -144,22 +144,22 @@ func ensureWorldLandCompositionBackup(path string, original []byte) error {
 	return nil
 }
 
-func writeWorldLandComposition(path string, contents []byte) error {
-	file, err := os.CreateTemp(filepath.Dir(path), ".env_playerLand-*.tmp")
+func writeAtomicClientFile(path string, contents []byte) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".client-config-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temporary island composition: %w", err)
+		return fmt.Errorf("create temporary client configuration: %w", err)
 	}
 	tempPath := file.Name()
 	defer os.Remove(tempPath)
 	if _, err := file.Write(contents); err != nil {
 		file.Close()
-		return fmt.Errorf("write temporary island composition: %w", err)
+		return fmt.Errorf("write temporary client configuration: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("close temporary island composition: %w", err)
+		return fmt.Errorf("close temporary client configuration: %w", err)
 	}
 	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("replace island composition: %w", err)
+		return fmt.Errorf("replace client configuration %s: %w", path, err)
 	}
 	return nil
 }

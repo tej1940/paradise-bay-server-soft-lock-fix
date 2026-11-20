@@ -9,3 +9,6 @@
 *.Appx
 *.appx
 /AppxPackageExtracted/
+
+# Local backups of edited client game compositions
+/client-config-backups/
