@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -17,7 +18,9 @@ import (
 
 // Store wraps the Bun database and provides game-data access methods.
 type Store struct {
-	db *bun.DB
+	db         *bun.DB
+	sessionsMu sync.Mutex
+	sessions   map[string]map[*gameSession]struct{}
 }
 
 var diveTutorialMissionIDs = []string{
@@ -58,6 +61,13 @@ type DocumentFragment struct {
 	UpdatedAt     string `bun:"updated_at,notnull"`
 }
 
+type WorldMarketSettingsRecord struct {
+	bun.BaseModel          `bun:"table:world_market_settings"`
+	Key                    string `bun:"key,pk"`
+	RefreshIntervalMinutes int    `bun:"refresh_interval_minutes,notnull"`
+	OfferCount             int    `bun:"offer_count,notnull"`
+}
+
 // TransactionRecord is a row in the transactions audit log.
 type TransactionRecord struct {
 	bun.BaseModel `bun:"table:transactions"`
@@ -94,6 +104,7 @@ func OpenDB(path string) (*Store, error) {
 		(*Friend)(nil),
 		(*VirtualFragment)(nil),
 		(*DocumentFragment)(nil),
+		(*WorldMarketSettingsRecord)(nil),
 		(*TransactionRecord)(nil),
 	}
 	for _, model := range models {
@@ -190,6 +201,9 @@ func (s *Store) seed(ctx context.Context) error {
 	for _, player := range players {
 		if err = s.SkipDiveTutorial(player.UUID); err != nil {
 			return fmt.Errorf("skip dive tutorial for player %s: %w", player.UUID, err)
+		}
+		if err = s.ensureWorldMarketCache(player.UUID); err != nil {
+			return fmt.Errorf("initialize world market for player %s: %w", player.UUID, err)
 		}
 	}
 
@@ -535,7 +549,10 @@ func (s *Store) CreatePlayer(uuid, alias, z2did string) (Player, error) {
 		if _, err := tx.NewInsert().Model(&p).Exec(ctx); err != nil {
 			return err
 		}
-		return s.skipDiveTutorialInTx(ctx, tx, p.UUID)
+		if err := s.skipDiveTutorialInTx(ctx, tx, p.UUID); err != nil {
+			return err
+		}
+		return s.ensureWorldMarketCacheInTx(ctx, tx, p.UUID)
 	})
 	return p, err
 }
@@ -653,6 +670,13 @@ func (s *Store) GetFragmentsForDocument(requestKey string) (map[string]string, e
 	}
 	docType := requestKey[:sep]
 	documentID := requestKey[sep+1:]
+	if docType == "GamePlayer" {
+		if playerUUID := worldMarketPlayerUUIDFromDocumentID(documentID); playerUUID != "" {
+			if err := s.ensureWorldMarketCache(playerUUID); err != nil {
+				return nil, fmt.Errorf("refresh world market for player %s: %w", playerUUID, err)
+			}
+		}
+	}
 
 	var frags []DocumentFragment
 	err := s.db.NewSelect().Model(&frags).

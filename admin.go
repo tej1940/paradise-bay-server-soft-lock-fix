@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -46,6 +47,36 @@ type playerBackup struct {
 func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 	mux.HandleFunc("GET /admin", serveAdminPanel)
 	mux.HandleFunc("GET /admin/", serveAdminPanel)
+	mux.HandleFunc("GET /admin/api/world-market/settings", func(w http.ResponseWriter, r *http.Request) {
+		if !requireLocalAdmin(w, r) {
+			return
+		}
+		settings, err := store.getWorldMarketSettings()
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "Impossible de charger les réglages du marché.")
+			return
+		}
+		writeJSON(w, http.StatusOK, settings)
+	})
+	mux.HandleFunc("PUT /admin/api/world-market/settings", func(w http.ResponseWriter, r *http.Request) {
+		if !requireLocalAdmin(w, r) {
+			return
+		}
+		var settings worldMarketSettings
+		if err := decodeAdminJSON(w, r, &settings); err != nil {
+			writeAdminError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := validateWorldMarketSettings(settings); err != nil {
+			writeAdminError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := store.setWorldMarketSettings(settings); err != nil {
+			writeAdminError(w, http.StatusInternalServerError, "Impossible d'enregistrer les réglages du marché.")
+			return
+		}
+		writeJSON(w, http.StatusOK, settings)
+	})
 	mux.HandleFunc("GET /admin/api/players", func(w http.ResponseWriter, r *http.Request) {
 		if !requireLocalAdmin(w, r) {
 			return
@@ -130,6 +161,30 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
+	mux.HandleFunc("POST /admin/api/players/{uuid}/world-market/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if !requireLocalAdmin(w, r) {
+			return
+		}
+		playerUUID := r.PathValue("uuid")
+		err := store.refreshWorldMarketCache(playerUUID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+		case err != nil:
+			writeAdminError(w, http.StatusInternalServerError, "Impossible d'actualiser le marché de ce joueur.")
+		default:
+			activeSessions, err := store.pushWorldMarketCacheUpdate(playerUUID)
+			if err != nil {
+				log.Printf("admin world market refresh: failed to notify player %s: %v", playerUUID, err)
+				writeAdminError(w, http.StatusInternalServerError, "Marché actualisé, mais impossible de notifier le client connecté.")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"ok":             true,
+				"activeSessions": activeSessions,
+			})
+		}
 	})
 	mux.HandleFunc("POST /admin/api/players/{uuid}/skip-seal-house-tutorial", func(w http.ResponseWriter, r *http.Request) {
 		if !requireLocalAdmin(w, r) {
@@ -319,9 +374,10 @@ button:disabled{opacity:.55;cursor:wait}.toolbar{display:flex;justify-content:sp
 table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #e6eef1}th{color:#58717c;font-weight:600}
 tr.player{cursor:pointer}tr.player:hover,tr.player.selected{background:#edf7f8}.muted{color:#607985;font-size:.88rem}.empty{padding:18px;text-align:center;color:#607985}
 label{display:block;font-weight:600;font-size:.9rem;margin:13px 0 5px}input{width:100%;border:1px solid #bcced5;border-radius:7px;padding:10px;font:inherit}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.notice{margin:12px 0;padding:10px;border-radius:7px;background:#edf7f8}.notice.error{background:#fbeceb;color:#8d2b25}
 .fragments{max-height:250px;overflow:auto;margin-top:8px}.fragments li{font-size:.82rem;overflow-wrap:anywhere;margin:7px 0}
-@media(max-width:760px){main{grid-template-columns:1fr}table{font-size:.82rem}th,td{padding:8px 4px}}
+@media(max-width:760px){main{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}table{font-size:.82rem}th,td{padding:8px 4px}}
 </style>
 </head>
 <body>
@@ -332,26 +388,41 @@ label{display:block;font-weight:600;font-size:.9rem;margin:13px 0 5px}input{widt
 <table><thead><tr><th>Pseudo</th><th>Identifiant appareil</th><th>Fragments</th></tr></thead><tbody id="players"></tbody></table>
 </section>
 <section><h2>Sauvegarde sélectionnée</h2><div id="details" class="muted">Choisissez un joueur pour consulter sa sauvegarde.</div></section>
+<section><h2>Marché mondial</h2>
+<p class="muted">Ces réglages s'appliquent globalement lors du prochain renouvellement. Le bouton renouvelle immédiatement le cache du joueur sélectionné ; le nouveau cache sera utilisé à la prochaine demande du jeu (fermer puis rouvrir le marché peut être nécessaire).</p>
+<form id="marketSettings">
+<div class="settings-grid">
+<div><label for="marketInterval">Intervalle entre les renouvellements (minutes)</label><input id="marketInterval" type="number" min="1" max="1440" step="1" required></div>
+<div><label for="marketOfferCount">Articles par renouvellement</label><input id="marketOfferCount" type="number" min="1" max="27" step="1" required></div>
+</div>
+<div class="actions"><button type="submit">Enregistrer les réglages</button><button type="button" class="secondary" id="refreshMarket" disabled>Actualiser le shop sélectionné</button></div>
+</form>
+<div id="marketStatus" class="muted" role="status">Chargement des réglages…</div>
+</section>
 </main>
 <script>
-const playersEl=document.querySelector("#players"),detailsEl=document.querySelector("#details"),statusEl=document.querySelector("#status");
+const playersEl=document.querySelector("#players"),detailsEl=document.querySelector("#details"),statusEl=document.querySelector("#status"),marketStatusEl=document.querySelector("#marketStatus"),refreshMarketButton=document.querySelector("#refreshMarket");
 let selected="";
 function esc(value){return String(value||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 async function request(url,options){const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw new Error(data.error||"Erreur serveur");return data}
 function setStatus(message,error=false){statusEl.textContent=message;statusEl.className=error?"notice error":"muted"}
+function setMarketStatus(message,error=false){marketStatusEl.textContent=message;marketStatusEl.className=error?"notice error":"muted"}
 async function refresh(){setStatus("Chargement…");try{const players=await request("/admin/api/players");playersEl.replaceChildren();if(!players.length){playersEl.innerHTML='<tr><td colspan="3" class="empty">Aucun joueur enregistré.</td></tr>'}
 for(const p of players){const tr=document.createElement("tr");tr.className="player"+(p.uuid===selected?" selected":"");tr.innerHTML="<td>"+esc(p.alias)+"<div class=\"muted\">"+esc(p.uuid)+"</div></td><td>"+esc(p.z2did||"—")+"</td><td>"+p.fragmentCount+"</td>";tr.addEventListener("click",()=>showPlayer(p.uuid));playersEl.append(tr)}
 setStatus(players.length+" joueur(s)");}catch(e){setStatus(e.message,true)}}
-async function showPlayer(uuid){selected=uuid;await refresh();try{const data=await request("/admin/api/players/"+encodeURIComponent(uuid));renderDetails(data.player,data.fragments)}catch(e){detailsEl.textContent=e.message}}
+async function loadMarketSettings(){try{const settings=await request("/admin/api/world-market/settings");document.querySelector("#marketInterval").value=settings.refreshIntervalMinutes;document.querySelector("#marketOfferCount").value=settings.offerCount;setMarketStatus("Réglages chargés.")}catch(e){setMarketStatus(e.message,true)}}
+async function showPlayer(uuid){selected=uuid;refreshMarketButton.disabled=!selected;await refresh();try{const data=await request("/admin/api/players/"+encodeURIComponent(uuid));renderDetails(data.player,data.fragments)}catch(e){detailsEl.textContent=e.message}}
 function renderDetails(p,fragments){detailsEl.innerHTML='<div class="muted">UUID : '+esc(p.uuid)+'</div><div class="notice">'+p.fragmentCount+' fragment(s) · dernière sauvegarde : '+esc(p.lastSavedAt||"indisponible")+'<br>Solde : '+p.nanopods+' nanopods · '+p.gems+' gemmes</div><form id="identity"><label for="alias">Pseudo</label><input id="alias" maxlength="100" required><label for="z2did">Identifiant appareil (z2did)</label><input id="z2did" maxlength="256"><p class="muted">Après réinstallation, le jeu peut créer un compte « Guest ». Notez son z2did dans la liste, arrêtez le jeu, supprimez ce compte provisoire, puis rattachez son z2did à cette sauvegarde.</p><button>Enregistrer le rattachement</button></form><div class="actions"><a class="button secondary" href="/admin/api/players/'+encodeURIComponent(p.uuid)+'/backup">Télécharger la sauvegarde</a><button type="button" class="secondary" id="restore">Restaurer un fichier</button><button type="button" class="danger" id="deletePlayer">Supprimer ce compte</button><input id="backupFile" type="file" accept="application/json,.json" hidden></div><h2 style="margin-top:22px">Fragments enregistrés</h2><ul class="fragments" id="fragmentList"></ul>';
 document.querySelector("#alias").value=p.alias;document.querySelector("#z2did").value=p.z2did||"";
 const list=document.querySelector("#fragmentList");if(!fragments.length){list.innerHTML="<li>Aucun fragment enregistré.</li>"}else for(const f of fragments){const li=document.createElement("li");li.textContent=f.key+" · "+f.updatedAt;list.append(li)}
 document.querySelector("#identity").addEventListener("submit",async e=>{e.preventDefault();try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({alias:document.querySelector("#alias").value,z2did:document.querySelector("#z2did").value})});setStatus("Joueur mis à jour.");await showPlayer(p.uuid)}catch(error){setStatus(error.message,true)}});
 const skipTutorial=document.createElement("button");skipTutorial.type="button";skipTutorial.className="secondary";skipTutorial.textContent="Débloquer la caméra (sauter le tutoriel)";skipTutorial.addEventListener("click",async()=>{if(!confirm("Arrêtez le jeu et téléchargez d'abord une sauvegarde. Cette action marque comme terminées les dernières missions du tutoriel de plongée pour ce joueur. Continuer ?"))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid)+"/skip-seal-house-tutorial",{method:"POST"});await showPlayer(p.uuid);setStatus("Tutoriel de plongée ignoré. Relancez le jeu pour appliquer le changement.")}catch(error){setStatus(error.message,true)}});document.querySelector(".actions").insertBefore(skipTutorial,document.querySelector("#deletePlayer"));
 const fileInput=document.querySelector("#backupFile");document.querySelector("#restore").addEventListener("click",()=>fileInput.click());fileInput.addEventListener("change",async()=>{if(!fileInput.files.length)return;if(!confirm("La restauration remplacera les données actuelles de ce joueur. Continuer ?")){fileInput.value="";return}try{const backup=JSON.parse(await fileInput.files[0].text());await request("/admin/api/players/"+encodeURIComponent(p.uuid)+"/restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(backup)});setStatus("Sauvegarde restaurée.");await showPlayer(p.uuid)}catch(error){setStatus(error.message,true)}finally{fileInput.value=""}});
-document.querySelector("#deletePlayer").addEventListener("click",async()=>{if(!confirm("Supprimer définitivement "+p.alias+" et tous ses fragments ? Téléchargez une sauvegarde avant de continuer."))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"DELETE"});selected="";detailsEl.textContent="Compte supprimé.";setStatus("Compte et données associés supprimés.");await refresh()}catch(error){setStatus(error.message,true)}});
+document.querySelector("#deletePlayer").addEventListener("click",async()=>{if(!confirm("Supprimer définitivement "+p.alias+" et tous ses fragments ? Téléchargez une sauvegarde avant de continuer."))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"DELETE"});selected="";refreshMarketButton.disabled=true;detailsEl.textContent="Compte supprimé.";setStatus("Compte et données associés supprimés.");await refresh()}catch(error){setStatus(error.message,true)}});
 }
-document.querySelector("#refresh").addEventListener("click",refresh);refresh();
+document.querySelector("#marketSettings").addEventListener("submit",async e=>{e.preventDefault();try{const settings={refreshIntervalMinutes:Number(document.querySelector("#marketInterval").value),offerCount:Number(document.querySelector("#marketOfferCount").value)};await request("/admin/api/world-market/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(settings)});setMarketStatus("Réglages enregistrés. Ils s'appliqueront au prochain renouvellement ; actualisez le shop sélectionné pour les appliquer tout de suite.")}catch(error){setMarketStatus(error.message,true)}});
+refreshMarketButton.addEventListener("click",async()=>{if(!selected)return;refreshMarketButton.disabled=true;try{const result=await request("/admin/api/players/"+encodeURIComponent(selected)+"/world-market/refresh",{method:"POST"});setMarketStatus(result.activeSessions>0?"Shop renouvelé et envoyé au client connecté. Si le marché est déjà ouvert, fermez puis rouvrez seulement le marché.":"Shop renouvelé. Aucun client connecté : les offres seront chargées à sa prochaine connexion.")}catch(error){setMarketStatus(error.message,true)}finally{refreshMarketButton.disabled=!selected}});
+document.querySelector("#refresh").addEventListener("click",refresh);refresh();loadMarketSettings();
 </script>
 </body>
 </html>`

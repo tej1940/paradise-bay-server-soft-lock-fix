@@ -41,4 +41,6 @@ After reinstalling, if the game creates a new `Guest` account, stop the game fir
 
 The server automatically skips the final seal-house dive tutorial missions for existing and new players. If the game is already open during the first server restart after updating, restart the game to load the updated mission progress. The selected player's panel also has a **Débloquer la caméra (sauter le tutoriel)** action; download a backup and stop the game before using it manually.
 
+The World Market is simulated locally with 14 randomized offers per player, refreshed every five minutes by default. In the admin panel, the **Marché mondial** controls let you set a server-wide refresh interval (1–1440 minutes) and offer count (1–27), then immediately regenerate the selected player's shop. Settings persist across server restarts; changes apply to each player's next refresh. Purchases from these offers are completed locally and the item is delivered through the game's mail system. The server does not connect players to a shared online market, and visiting simulated sellers is not implemented.
+
 The admin panel and its API are available only from the same computer. The game HTTP endpoints continue to use their existing network binding.

@@ -25,6 +25,8 @@ const (
 	LuaSessionMessage        Command = "luaSessionMessage"
 	Luas                     Command = "luas"
 	GetInAppProducts         Command = "getInAppProducts2"
+	GetWorldMarketViews      Command = "getWorldMarketViews"
+	GetFullWorldMarketView   Command = "getFullWorldMarketView"
 	ExecuteTransaction       Command = "executeTransaction"
 	ExecuteCommand           Command = "executeCommand"
 )

@@ -16,6 +16,82 @@ import (
 	"github.com/google/uuid"
 )
 
+type socketInput struct {
+	data any
+	err  error
+}
+
+type worldMarketPush struct {
+	key      string
+	blobJSON string
+}
+
+type gameSession struct {
+	playerUUID string
+	pushes     chan worldMarketPush
+}
+
+func (s *Store) registerGameSession(playerUUID string) *gameSession {
+	session := &gameSession{
+		playerUUID: playerUUID,
+		pushes:     make(chan worldMarketPush, 1),
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if s.sessions == nil {
+		s.sessions = make(map[string]map[*gameSession]struct{})
+	}
+	if s.sessions[playerUUID] == nil {
+		s.sessions[playerUUID] = make(map[*gameSession]struct{})
+	}
+	s.sessions[playerUUID][session] = struct{}{}
+	return session
+}
+
+func (s *Store) unregisterGameSession(session *gameSession) {
+	if session == nil {
+		return
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	delete(s.sessions[session.playerUUID], session)
+	if len(s.sessions[session.playerUUID]) == 0 {
+		delete(s.sessions, session.playerUUID)
+	}
+}
+
+func (s *Store) pushWorldMarketCacheUpdate(playerUUID string) (int, error) {
+	key := worldMarketCacheKey(playerUUID)
+	blob, err := s.GetFragment(key)
+	if err != nil {
+		return 0, fmt.Errorf("load refreshed world market cache for player %s: %w", playerUUID, err)
+	}
+	update := worldMarketPush{key: key, blobJSON: blob}
+
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	sessions := s.sessions[playerUUID]
+	for session := range sessions {
+		select {
+		case session.pushes <- update:
+		default:
+			select {
+			case <-session.pushes:
+			default:
+			}
+			session.pushes <- update
+		}
+	}
+	return len(sessions), nil
+}
+
+func sessionPushes(session *gameSession) <-chan worldMarketPush {
+	if session == nil {
+		return nil
+	}
+	return session.pushes
+}
+
 // traceEnabled turns on per-message socket logging (incoming cmd/req/ack and
 // outgoing cmd/res) when PB_TRACE=1. Off by default to keep the log readable;
 // enable it to diagnose connection drops.
@@ -59,11 +135,18 @@ func StartSocket(port int, store *Store) {
 
 func handleMessage(conn net.Conn, store *Store) {
 	defer conn.Close()
+	stopReading := make(chan struct{})
+	defer close(stopReading)
 
 	// Per-connection state: res counter, transaction map, and the authenticated player UUID.
 	nextRes := 0
 	transactions := make(map[int]*TransactionContext)
 	var playerUUID string
+	var activeTcID int
+	var activeSession *gameSession
+	defer func() {
+		store.unregisterGameSession(activeSession)
+	}()
 
 	// One continuous zlib stream for reading (client sends all messages in one stream)
 	zlibReader, err := zlib.NewReader(conn)
@@ -80,14 +163,49 @@ func handleMessage(conn net.Conn, store *Store) {
 	zlibWriter := zlib.NewWriter(conn)
 	defer zlibWriter.Close()
 
+	incoming := make(chan socketInput, 1)
+	go func() {
+		for {
+			var data any
+			err := decoder.Decode(&data)
+			select {
+			case incoming <- socketInput{data: data, err: err}:
+			case <-stopReading:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	for {
 		var data any
-		if err = decoder.Decode(&data); err != nil {
-			if err == io.EOF {
-				break
+		select {
+		case input := <-incoming:
+			if input.err != nil {
+				if input.err != io.EOF {
+					log.Println("Error decoding JSON:", input.err)
+				}
+				return
 			}
-			log.Println("Error decoding JSON:", err)
-			break
+			data = input.data
+		case update := <-sessionPushes(activeSession):
+			sendErr := sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
+				"type":          "requestDocumentsResponse",
+				"tcId":          activeTcID,
+				"blobStoreKeys": []string{update.key},
+				"updates": []map[string]interface{}{{
+					"documentFragmentId": update.key,
+					"blobJson":           update.blobJSON,
+				}},
+			})
+			if sendErr != nil {
+				log.Printf("world market push: failed to send update to player %s: %v", playerUUID, sendErr)
+				return
+			}
+			log.Printf("world market push: sent refreshed cache to player %s", playerUUID)
+			continue
 		}
 		if reflect.TypeOf(data).Kind() == reflect.Float64 {
 			continue
@@ -151,6 +269,8 @@ func handleMessage(conn net.Conn, store *Store) {
 			// before any replayed transactions run.
 			if sendErr == nil {
 				if tcID := store.GetPlayerTcID(player.UUID); tcID != 0 {
+					activeTcID = tcID
+					activeSession = store.registerGameSession(playerUUID)
 					sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
 						"type":                           "sessionConfiguration",
 						"tcId":                           tcID,
@@ -165,6 +285,7 @@ func handleMessage(conn net.Conn, store *Store) {
 		case OnNewTransactionContext:
 			eventData := msgData.(map[string]interface{})
 			tcID := int(eventData["tcId"].(float64))
+			activeTcID = tcID
 			timelineId := int(eventData["timelineId"].(float64))
 			transactions[tcID] = &TransactionContext{
 				TransactionID: tcID,
@@ -174,6 +295,9 @@ func handleMessage(conn net.Conn, store *Store) {
 			if playerUUID != "" {
 				if err := store.SetPlayerTcID(playerUUID, tcID); err != nil {
 					log.Printf("onNewTransactionContext: failed to save tcId: %v", err)
+				}
+				if activeSession == nil {
+					activeSession = store.registerGameSession(playerUUID)
 				}
 			}
 			sendErr = sendMessage(zlibWriter, &nextRes, Luas, req, map[string]interface{}{})
@@ -265,6 +389,10 @@ func handleMessage(conn net.Conn, store *Store) {
 			updates := make([]map[string]interface{}, 0, len(fragmentIds))
 			for _, id := range fragmentIds {
 				key := id.(string)
+				if err := store.ensureWorldMarketCacheForFragment(key); err != nil {
+					log.Printf("requestDocumentFragments: failed to refresh world market cache %s: %v", key, err)
+					continue
+				}
 				blobJson := store.FragmentBlob(key)
 				if blobJson == "" {
 					log.Printf("requestDocumentFragments: no blob for %s, skipping", key)
@@ -313,6 +441,8 @@ func handleMessage(conn net.Conn, store *Store) {
 			// .blob field with the actual JSON — we persist those to document_fragments.
 			var transactionId, timelineId interface{}
 			var tcId float64
+			var purchaseUpdates []worldMarketPurchaseUpdate
+			sendErr = nil
 			if md, ok := msgData.(map[string]interface{}); ok {
 				if msg, ok := md["message"].(map[string]interface{}); ok {
 					transactionId = msg["transactionId"]
@@ -323,6 +453,7 @@ func handleMessage(conn net.Conn, store *Store) {
 
 					// Parse invoke for the audit log.
 					playerUUID, facade, methodName, args := "", "", "", ""
+					var invokeArgs []interface{}
 					if inv, ok := msg["invoke"].(map[string]interface{}); ok {
 						methodName, _ = inv["methodName"].(string)
 						if fc, ok := inv["facade"].(map[string]interface{}); ok {
@@ -334,6 +465,7 @@ func handleMessage(conn net.Conn, store *Store) {
 							}
 						}
 						if a, ok := inv["args"].([]interface{}); ok {
+							invokeArgs = a
 							if b, err := json.Marshal(a); err == nil {
 								args = string(b)
 							}
@@ -389,14 +521,42 @@ func handleMessage(conn net.Conn, store *Store) {
 							}
 						}
 					}
+
+					if facade == "TKMarketTransactions" && methodName == "buyFromPlayer" {
+						var err error
+						purchaseUpdates, err = store.completeWorldMarketPurchase(playerUUID, invokeArgs)
+						if err != nil {
+							log.Printf("executeTransaction: failed to complete simulated market purchase: %v", err)
+						}
+					}
 				}
 			}
-			sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
-				"type":          "transactionAccepted",
-				"tcId":          tcId,
-				"transactionId": transactionId,
-				"timelineId":    timelineId,
-			})
+
+			if len(purchaseUpdates) > 0 {
+				keys := make([]string, 0, len(purchaseUpdates))
+				updates := make([]map[string]interface{}, 0, len(purchaseUpdates))
+				for _, update := range purchaseUpdates {
+					keys = append(keys, update.Key)
+					updates = append(updates, map[string]interface{}{
+						"documentFragmentId": update.Key,
+						"blobJson":           update.BlobJSON,
+					})
+				}
+				sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
+					"type":          "requestDocumentsResponse",
+					"tcId":          tcId,
+					"blobStoreKeys": keys,
+					"updates":       updates,
+				})
+			}
+			if sendErr == nil {
+				sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
+					"type":          "transactionAccepted",
+					"tcId":          tcId,
+					"transactionId": transactionId,
+					"timelineId":    timelineId,
+				})
+			}
 			// Ack the "luas" request itself (matched by req) so the client clears the
 			// pending request and cancels its ResponseTimeoutTimer. Without this the
 			// socket channel times out (~20s) and force-reconnects, replaying
@@ -480,6 +640,24 @@ func handleMessage(conn net.Conn, store *Store) {
 				"productsWithBundles": []interface{}{},
 			})
 
+		case GetWorldMarketViews:
+			response, err := store.worldMarketViewsResponse(playerUUID, msgData)
+			if err != nil {
+				log.Printf("getWorldMarketViews: failed to build views: %v", err)
+				sendErr = err
+			} else {
+				sendErr = sendMessage(zlibWriter, &nextRes, cmd, req, response)
+			}
+
+		case GetFullWorldMarketView:
+			response, err := store.worldMarketFullViewResponse(playerUUID)
+			if err != nil {
+				log.Printf("getFullWorldMarketView: failed to build views: %v", err)
+				sendErr = err
+			} else {
+				sendErr = sendMessage(zlibWriter, &nextRes, cmd, req, response)
+			}
+
 		default:
 			sendErr = sendMessage(zlibWriter, &nextRes, cmd, req, nil)
 		}
@@ -540,6 +718,19 @@ func resolvePlayer(store *Store, msgData any) (Player, error) {
 // serverOnly flow blocks forever waiting for a response.
 func resolveServerCommand(store *Store, playerUUID, methodName string, args []interface{}) string {
 	switch methodName {
+	case "getFullWorldMarketView":
+		response, err := store.worldMarketFullViewResponse(playerUUID)
+		if err != nil {
+			log.Printf("executeCommand getFullWorldMarketView: failed to build views: %v", err)
+			return "null"
+		}
+		blob, err := json.Marshal(response)
+		if err != nil {
+			log.Printf("executeCommand getFullWorldMarketView: failed to encode views: %v", err)
+			return "null"
+		}
+		return string(blob)
+
 	case "getAliases":
 		alias, gameAlias := playerAliases(store, playerUUID)
 		aliases := map[string]interface{}{"bestAlias": alias}

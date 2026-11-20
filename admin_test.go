@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newAdminTestServer(t *testing.T) (*Store, *http.ServeMux) {
@@ -268,5 +269,164 @@ func assertDiveTutorialSkipped(t *testing.T, store *Store, uuid string) {
 		if !completed[missionID] {
 			t.Errorf("mission %q is not marked complete in cache", missionID)
 		}
+	}
+}
+
+func TestAdminWorldMarketSettingsAndSelectedPlayerRefresh(t *testing.T) {
+	store, mux := newAdminTestServer(t)
+	selectedPlayer, err := store.CreatePlayer("market-selected", "Selected Island", "market-selected-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPlayer, err := store.CreatePlayer("market-other", "Other Island", "market-other-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedSession := store.registerGameSession(selectedPlayer.UUID)
+	defer store.unregisterGameSession(selectedSession)
+	otherSession := store.registerGameSession(otherPlayer.UUID)
+	defer store.unregisterGameSession(otherSession)
+	otherCacheBefore, err := store.GetFragment(worldMarketCacheKey(otherPlayer.UUID))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	getRequest := httptest.NewRequest(http.MethodGet, "/admin/api/world-market/settings", nil)
+	getRequest.RemoteAddr = "127.0.0.1:12345"
+	getResponse := httptest.NewRecorder()
+	mux.ServeHTTP(getResponse, getRequest)
+	if getResponse.Code != http.StatusOK {
+		t.Fatalf("get market settings status = %d, want %d: %s", getResponse.Code, http.StatusOK, getResponse.Body.String())
+	}
+	var settings worldMarketSettings
+	if err := json.Unmarshal(getResponse.Body.Bytes(), &settings); err != nil {
+		t.Fatalf("decode default market settings: %v", err)
+	}
+	if settings.RefreshIntervalMinutes != worldMarketDefaultRefreshIntervalMinutes || settings.OfferCount != worldMarketOfferCount {
+		t.Fatalf("default market settings = %+v", settings)
+	}
+
+	invalidRequest := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/api/world-market/settings",
+		strings.NewReader(`{"refreshIntervalMinutes":0,"offerCount":3}`),
+	)
+	invalidRequest.RemoteAddr = "127.0.0.1:12345"
+	invalidRequest.Header.Set("Content-Type", "application/json")
+	invalidResponse := httptest.NewRecorder()
+	mux.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid settings status = %d, want %d", invalidResponse.Code, http.StatusBadRequest)
+	}
+
+	settingsBody := `{"refreshIntervalMinutes":2,"offerCount":3}`
+	saveRequest := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/api/world-market/settings",
+		strings.NewReader(settingsBody),
+	)
+	saveRequest.RemoteAddr = "127.0.0.1:12345"
+	saveRequest.Header.Set("Content-Type", "application/json")
+	saveResponse := httptest.NewRecorder()
+	mux.ServeHTTP(saveResponse, saveRequest)
+	if saveResponse.Code != http.StatusOK {
+		t.Fatalf("save market settings status = %d, want %d: %s", saveResponse.Code, http.StatusOK, saveResponse.Body.String())
+	}
+
+	refreshRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/api/players/"+selectedPlayer.UUID+"/world-market/refresh",
+		nil,
+	)
+	refreshRequest.RemoteAddr = "127.0.0.1:12345"
+	refreshResponse := httptest.NewRecorder()
+	mux.ServeHTTP(refreshResponse, refreshRequest)
+	if refreshResponse.Code != http.StatusOK {
+		t.Fatalf("refresh selected market status = %d, want %d: %s", refreshResponse.Code, http.StatusOK, refreshResponse.Body.String())
+	}
+	var refreshResult struct {
+		ActiveSessions int `json:"activeSessions"`
+	}
+	if err := json.Unmarshal(refreshResponse.Body.Bytes(), &refreshResult); err != nil {
+		t.Fatalf("decode refresh result: %v", err)
+	}
+	if refreshResult.ActiveSessions != 1 {
+		t.Fatalf("active sessions notified = %d, want 1", refreshResult.ActiveSessions)
+	}
+
+	selectedCacheBlob, err := store.GetFragment(worldMarketCacheKey(selectedPlayer.UUID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selectedCache worldMarketCacheFragment
+	if err := json.Unmarshal([]byte(selectedCacheBlob), &selectedCache); err != nil {
+		t.Fatalf("decode refreshed selected market: %v", err)
+	}
+	if len(selectedCache.View) != 3 {
+		t.Fatalf("selected player offer count = %d, want 3", len(selectedCache.View))
+	}
+	select {
+	case update := <-selectedSession.pushes:
+		if update.key != worldMarketCacheKey(selectedPlayer.UUID) || update.blobJSON != selectedCacheBlob {
+			t.Fatal("active player session did not receive the refreshed market cache")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active player session did not receive a market refresh notification")
+	}
+	select {
+	case <-otherSession.pushes:
+		t.Fatal("market refresh notification was sent to another player's session")
+	default:
+	}
+	for i, rawView := range selectedCache.View {
+		var view worldMarketCachedView
+		if err := json.Unmarshal(rawView, &view); err != nil {
+			t.Fatalf("decode refreshed selected market view %d: %v", i, err)
+		}
+		if view.UUID == "" || len(view.Slots) != 1 || len(view.Sales) != 1 {
+			t.Fatalf("refreshed selected market view %d is malformed: %+v", i, view)
+		}
+	}
+	now := time.Now().UnixMilli()
+	if selectedCache.NextRefreshTimeMillis <= now ||
+		selectedCache.NextRefreshTimeMillis > time.Now().Add(3*time.Minute).UnixMilli() {
+		t.Fatalf("selected market next refresh time %d is not about two minutes ahead", selectedCache.NextRefreshTimeMillis)
+	}
+
+	otherCacheAfter, err := store.GetFragment(worldMarketCacheKey(otherPlayer.UUID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherCacheAfter != otherCacheBefore {
+		t.Fatal("refreshing the selected player's market changed another player's market")
+	}
+
+	persistedSettings, err := store.getWorldMarketSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persistedSettings.RefreshIntervalMinutes != 2 || persistedSettings.OfferCount != 3 {
+		t.Fatalf("persisted market settings = %+v, want 2 minutes and 3 offers", persistedSettings)
+	}
+}
+
+func TestAdminPanelKeepsSaveManagementVisible(t *testing.T) {
+	_, mux := newAdminTestServer(t)
+	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	request.RemoteAddr = "127.0.0.1:12345"
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("admin panel status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	html := response.Body.String()
+	saveSection := strings.Index(html, "<section><h2>Sauvegarde sélectionnée</h2>")
+	marketSection := strings.Index(html, "<section><h2>Marché mondial</h2>")
+	if saveSection < 0 || marketSection < 0 || saveSection > marketSection {
+		t.Fatal("save section should appear before the market controls")
+	}
+	if !strings.Contains(html, "Télécharger la sauvegarde") || !strings.Contains(html, "Restaurer un fichier") {
+		t.Fatal("admin panel is missing backup or restore controls")
 	}
 }
