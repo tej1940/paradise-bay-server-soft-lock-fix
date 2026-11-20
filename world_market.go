@@ -513,13 +513,13 @@ func validateWorldMarketSettings(settings worldMarketSettings) error {
 	if settings.RefreshIntervalMinutes < worldMarketMinRefreshIntervalMinutes ||
 		settings.RefreshIntervalMinutes > worldMarketMaxRefreshIntervalMinutes {
 		return fmt.Errorf(
-			"l'intervalle doit être compris entre %d et %d minutes",
+			"refresh interval must be between %d and %d minutes",
 			worldMarketMinRefreshIntervalMinutes,
 			worldMarketMaxRefreshIntervalMinutes,
 		)
 	}
 	if settings.OfferCount < 1 || settings.OfferCount > len(worldMarketResources) {
-		return fmt.Errorf("le nombre d'articles doit être compris entre 1 et %d", len(worldMarketResources))
+		return fmt.Errorf("offer count must be between 1 and %d", len(worldMarketResources))
 	}
 	return nil
 }
@@ -531,14 +531,14 @@ func (s *Store) getWorldMarketSettings() (worldMarketSettings, error) {
 		return defaultWorldMarketSettings(), nil
 	}
 	if err != nil {
-		return worldMarketSettings{}, fmt.Errorf("charger les réglages du marché: %w", err)
+		return worldMarketSettings{}, fmt.Errorf("load world market settings: %w", err)
 	}
 	settings := worldMarketSettings{
 		RefreshIntervalMinutes: record.RefreshIntervalMinutes,
 		OfferCount:             record.OfferCount,
 	}
 	if err := validateWorldMarketSettings(settings); err != nil {
-		return worldMarketSettings{}, fmt.Errorf("les réglages sauvegardés du marché sont invalides: %w", err)
+		return worldMarketSettings{}, fmt.Errorf("saved world market settings are invalid: %w", err)
 	}
 	return settings, nil
 }
@@ -556,7 +556,7 @@ func (s *Store) setWorldMarketSettings(settings worldMarketSettings) error {
 		On("CONFLICT (key) DO UPDATE SET refresh_interval_minutes = EXCLUDED.refresh_interval_minutes, offer_count = EXCLUDED.offer_count").
 		Exec(context.Background())
 	if err != nil {
-		return fmt.Errorf("enregistrer les réglages du marché: %w", err)
+		return fmt.Errorf("save world market settings: %w", err)
 	}
 	return nil
 }
@@ -568,14 +568,14 @@ func getWorldMarketSettingsInTx(ctx context.Context, tx bun.Tx) (worldMarketSett
 		return defaultWorldMarketSettings(), nil
 	}
 	if err != nil {
-		return worldMarketSettings{}, fmt.Errorf("charger les réglages du marché: %w", err)
+		return worldMarketSettings{}, fmt.Errorf("load world market settings: %w", err)
 	}
 	settings := worldMarketSettings{
 		RefreshIntervalMinutes: record.RefreshIntervalMinutes,
 		OfferCount:             record.OfferCount,
 	}
 	if err := validateWorldMarketSettings(settings); err != nil {
-		return worldMarketSettings{}, fmt.Errorf("les réglages sauvegardés du marché sont invalides: %w", err)
+		return worldMarketSettings{}, fmt.Errorf("saved world market settings are invalid: %w", err)
 	}
 	return settings, nil
 }

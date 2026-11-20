@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,9 +19,11 @@ import (
 
 // Store wraps the Bun database and provides game-data access methods.
 type Store struct {
-	db         *bun.DB
-	sessionsMu sync.Mutex
-	sessions   map[string]map[*gameSession]struct{}
+	db             *bun.DB
+	sessionsMu     sync.Mutex
+	sessions       map[string]map[*gameSession]struct{}
+	clientConfigMu sync.Mutex
+	appxPackageDir string
 }
 
 var diveTutorialMissionIDs = []string{
@@ -128,7 +131,10 @@ func OpenDB(path string) (*Store, error) {
 		}
 	}
 
-	s := &Store{db: db}
+	s := &Store{
+		db:             db,
+		appxPackageDir: filepath.Join(filepath.Dir(path), "AppxPackageExtracted"),
+	}
 	if err = s.seed(ctx); err != nil {
 		return nil, err
 	}

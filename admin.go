@@ -17,7 +17,7 @@ import (
 
 const maxBackupBytes = 32 << 20
 
-var errDeviceIDAlreadyLinked = errors.New("cet identifiant appareil est déjà rattaché à un autre joueur")
+var errDeviceIDAlreadyLinked = errors.New("this device ID is already linked to another player")
 
 type playerSummary struct {
 	UUID                 string  `json:"uuid"`
@@ -47,13 +47,48 @@ type playerBackup struct {
 func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 	mux.HandleFunc("GET /admin", serveAdminPanel)
 	mux.HandleFunc("GET /admin/", serveAdminPanel)
+	mux.HandleFunc("GET /admin/api/game/world-snow", func(w http.ResponseWriter, r *http.Request) {
+		if !requireLocalAdmin(w, r) {
+			return
+		}
+		settings, err := store.getWorldSnowSettings()
+		if err != nil {
+			log.Printf("admin world snow settings: failed to load client composition: %v", err)
+			writeAdminError(w, http.StatusServiceUnavailable, "Could not read the game composition. Check that the AppxPackageExtracted folder exists.")
+			return
+		}
+		writeJSON(w, http.StatusOK, settings)
+	})
+	mux.HandleFunc("PUT /admin/api/game/world-snow", func(w http.ResponseWriter, r *http.Request) {
+		if !requireLocalAdmin(w, r) {
+			return
+		}
+		var input struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := decodeAdminJSON(w, r, &input); err != nil {
+			writeAdminError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if input.Enabled == nil {
+			writeAdminError(w, http.StatusBadRequest, "The enabled field is required.")
+			return
+		}
+		settings := worldSnowSettings{Enabled: *input.Enabled}
+		if err := store.setWorldSnowEnabled(settings.Enabled); err != nil {
+			log.Printf("admin world snow settings: failed to update client composition: %v", err)
+			writeAdminError(w, http.StatusInternalServerError, "Could not update ground snow. The composition file and its original backup must be available.")
+			return
+		}
+		writeJSON(w, http.StatusOK, settings)
+	})
 	mux.HandleFunc("GET /admin/api/world-market/settings", func(w http.ResponseWriter, r *http.Request) {
 		if !requireLocalAdmin(w, r) {
 			return
 		}
 		settings, err := store.getWorldMarketSettings()
 		if err != nil {
-			writeAdminError(w, http.StatusInternalServerError, "Impossible de charger les réglages du marché.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not load market settings.")
 			return
 		}
 		writeJSON(w, http.StatusOK, settings)
@@ -72,7 +107,7 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 			return
 		}
 		if err := store.setWorldMarketSettings(settings); err != nil {
-			writeAdminError(w, http.StatusInternalServerError, "Impossible d'enregistrer les réglages du marché.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not save market settings.")
 			return
 		}
 		writeJSON(w, http.StatusOK, settings)
@@ -83,14 +118,14 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		}
 		players, err := store.ListPlayers()
 		if err != nil {
-			writeAdminError(w, http.StatusInternalServerError, "Impossible de charger les joueurs.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not load players.")
 			return
 		}
 		summaries := make([]playerSummary, 0, len(players))
 		for _, player := range players {
 			fragments, err := store.GetPlayerFragments(player.UUID)
 			if err != nil {
-				writeAdminError(w, http.StatusInternalServerError, "Impossible de charger les sauvegardes.")
+				writeAdminError(w, http.StatusInternalServerError, "Could not load player saves.")
 				return
 			}
 			summaries = append(summaries, summarizePlayer(player, fragments))
@@ -133,7 +168,7 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		input.Alias = strings.TrimSpace(input.Alias)
 		input.Z2DID = strings.TrimSpace(input.Z2DID)
 		if input.Alias == "" || len(input.Alias) > 100 || len(input.Z2DID) > 256 {
-			writeAdminError(w, http.StatusBadRequest, "Le pseudo doit contenir 1 à 100 caractères et l'identifiant appareil au maximum 256 caractères.")
+			writeAdminError(w, http.StatusBadRequest, "The alias must be 1 to 100 characters and the device ID must be no more than 256 characters.")
 			return
 		}
 		err := store.SetPlayerIdentity(r.PathValue("uuid"), input.Alias, input.Z2DID)
@@ -141,9 +176,9 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		case errors.Is(err, errDeviceIDAlreadyLinked):
 			writeAdminError(w, http.StatusConflict, err.Error())
 		case errors.Is(err, sql.ErrNoRows):
-			writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+			writeAdminError(w, http.StatusNotFound, "Player not found.")
 		case err != nil:
-			writeAdminError(w, http.StatusInternalServerError, "Impossible de modifier le joueur.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not update the player.")
 		default:
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		}
@@ -154,9 +189,9 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		}
 		if err := store.DeletePlayer(r.PathValue("uuid")); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+				writeAdminError(w, http.StatusNotFound, "Player not found.")
 			} else {
-				writeAdminError(w, http.StatusInternalServerError, "Impossible de supprimer le joueur.")
+				writeAdminError(w, http.StatusInternalServerError, "Could not delete the player.")
 			}
 			return
 		}
@@ -170,14 +205,14 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		err := store.refreshWorldMarketCache(playerUUID)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+			writeAdminError(w, http.StatusNotFound, "Player not found.")
 		case err != nil:
-			writeAdminError(w, http.StatusInternalServerError, "Impossible d'actualiser le marché de ce joueur.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not refresh this player's market.")
 		default:
 			activeSessions, err := store.pushWorldMarketCacheUpdate(playerUUID)
 			if err != nil {
 				log.Printf("admin world market refresh: failed to notify player %s: %v", playerUUID, err)
-				writeAdminError(w, http.StatusInternalServerError, "Marché actualisé, mais impossible de notifier le client connecté.")
+				writeAdminError(w, http.StatusInternalServerError, "Market refreshed, but could not notify the connected client.")
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -193,9 +228,9 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		err := store.SkipDiveTutorial(r.PathValue("uuid"))
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+			writeAdminError(w, http.StatusNotFound, "Player not found.")
 		case err != nil:
-			writeAdminError(w, http.StatusInternalServerError, "Impossible de modifier la progression des missions.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not update mission progress.")
 		default:
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		}
@@ -225,9 +260,9 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		currentPlayer, err := store.GetPlayerByCID(uuid)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+				writeAdminError(w, http.StatusNotFound, "Player not found.")
 			} else {
-				writeAdminError(w, http.StatusInternalServerError, "Impossible de charger le joueur.")
+				writeAdminError(w, http.StatusInternalServerError, "Could not load the player.")
 			}
 			return
 		}
@@ -237,7 +272,7 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 			return
 		}
 		if backup.Version != 1 || backup.Player.UUID != uuid || strings.TrimSpace(backup.Player.Alias) == "" || backup.Fragments == nil {
-			writeAdminError(w, http.StatusBadRequest, "Cette sauvegarde n'est pas compatible avec ce joueur.")
+			writeAdminError(w, http.StatusBadRequest, "This backup is not compatible with this player.")
 			return
 		}
 		// A restore must not undo a device relink performed after the backup was made.
@@ -248,11 +283,11 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		for i := range backup.Fragments {
 			fragment := &backup.Fragments[i]
 			if fragment.Key == "" || len(fragment.Key) > 2048 || !strings.Contains(fragment.Key, uuid) || !json.Valid([]byte(fragment.BlobJSON)) {
-				writeAdminError(w, http.StatusBadRequest, "La sauvegarde contient un fragment invalide ou appartenant à un autre joueur.")
+				writeAdminError(w, http.StatusBadRequest, "The backup contains an invalid fragment or one belonging to another player.")
 				return
 			}
 			if _, duplicate := seen[fragment.Key]; duplicate {
-				writeAdminError(w, http.StatusBadRequest, "La sauvegarde contient des fragments en double.")
+				writeAdminError(w, http.StatusBadRequest, "The backup contains duplicate fragments.")
 				return
 			}
 			seen[fragment.Key] = struct{}{}
@@ -262,9 +297,9 @@ func registerAdminRoutes(mux *http.ServeMux, store *Store) {
 		}
 		if err := store.ReplacePlayerSave(backup.Player, backup.Fragments); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+				writeAdminError(w, http.StatusNotFound, "Player not found.")
 			} else {
-				writeAdminError(w, http.StatusInternalServerError, "La restauration a échoué ; aucune modification n'a été appliquée.")
+				writeAdminError(w, http.StatusInternalServerError, "Restore failed; no changes were applied.")
 			}
 			return
 		}
@@ -295,15 +330,15 @@ func loadAdminPlayer(w http.ResponseWriter, store *Store, uuid string) (Player, 
 	player, err := store.GetPlayerByCID(uuid)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			writeAdminError(w, http.StatusNotFound, "Joueur introuvable.")
+			writeAdminError(w, http.StatusNotFound, "Player not found.")
 		} else {
-			writeAdminError(w, http.StatusInternalServerError, "Impossible de charger le joueur.")
+			writeAdminError(w, http.StatusInternalServerError, "Could not load the player.")
 		}
 		return Player{}, nil, false
 	}
 	fragments, err := store.GetPlayerFragments(uuid)
 	if err != nil {
-		writeAdminError(w, http.StatusInternalServerError, "Impossible de charger la sauvegarde.")
+		writeAdminError(w, http.StatusInternalServerError, "Could not load the save.")
 		return Player{}, nil, false
 	}
 	return player, fragments, true
@@ -326,11 +361,11 @@ func decodeAdminJSON(w http.ResponseWriter, r *http.Request, destination interfa
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
-		return fmt.Errorf("JSON invalide : %w", err)
+		return fmt.Errorf("invalid JSON: %w", err)
 	}
 	var extra interface{}
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("le corps doit contenir un seul objet JSON")
+		return fmt.Errorf("request body must contain a single JSON object")
 	}
 	return nil
 }
@@ -357,7 +392,7 @@ func serveAdminPanel(w http.ResponseWriter, r *http.Request) {
 }
 
 const adminPanelHTML = `<!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -374,6 +409,7 @@ button:disabled{opacity:.55;cursor:wait}.toolbar{display:flex;justify-content:sp
 table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #e6eef1}th{color:#58717c;font-weight:600}
 tr.player{cursor:pointer}tr.player:hover,tr.player.selected{background:#edf7f8}.muted{color:#607985;font-size:.88rem}.empty{padding:18px;text-align:center;color:#607985}
 label{display:block;font-weight:600;font-size:.9rem;margin:13px 0 5px}input{width:100%;border:1px solid #bcced5;border-radius:7px;padding:10px;font:inherit}
+.toggle-row{display:flex;align-items:center;gap:9px;margin:12px 0}.toggle-row input{width:auto;margin:0}
 .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.notice{margin:12px 0;padding:10px;border-radius:7px;background:#edf7f8}.notice.error{background:#fbeceb;color:#8d2b25}
 .fragments{max-height:250px;overflow:auto;margin-top:8px}.fragments li{font-size:.82rem;overflow-wrap:anywhere;margin:7px 0}
@@ -381,48 +417,59 @@ label{display:block;font-weight:600;font-size:.9rem;margin:13px 0 5px}input{widt
 </style>
 </head>
 <body>
-<header><h1>Paradise Bay — Administration</h1><p>Gérez les joueurs et récupérez une sauvegarde après une réinstallation.</p></header>
+<header><h1>Paradise Bay — Administration</h1><p>Manage players and retrieve saves after reinstalling.</p></header>
 <main>
-<section><div class="toolbar"><h2>Joueurs</h2><button class="secondary" id="refresh">Actualiser</button></div>
-<div id="status" class="muted" role="status">Chargement…</div>
-<table><thead><tr><th>Pseudo</th><th>Identifiant appareil</th><th>Fragments</th></tr></thead><tbody id="players"></tbody></table>
+<section><div class="toolbar"><h2>Players</h2><button class="secondary" id="refresh">Refresh</button></div>
+<div id="status" class="muted" role="status">Loading…</div>
+<table><thead><tr><th>Alias</th><th>Device ID</th><th>Fragments</th></tr></thead><tbody id="players"></tbody></table>
 </section>
-<section><h2>Sauvegarde sélectionnée</h2><div id="details" class="muted">Choisissez un joueur pour consulter sa sauvegarde.</div></section>
-<section><h2>Marché mondial</h2>
-<p class="muted">Ces réglages s'appliquent globalement lors du prochain renouvellement. Le bouton renouvelle immédiatement le cache du joueur sélectionné ; le nouveau cache sera utilisé à la prochaine demande du jeu (fermer puis rouvrir le marché peut être nécessaire).</p>
+<section><h2>Selected Player Save</h2><div id="details" class="muted">Select a player to view their save.</div></section>
+<section><h2>World Market</h2>
+<p class="muted">These settings apply globally at the next refresh. The button immediately regenerates the selected player's cache; the updated cache will be used the next time the game requests the market (you may need to close and reopen the market).</p>
 <form id="marketSettings">
 <div class="settings-grid">
-<div><label for="marketInterval">Intervalle entre les renouvellements (minutes)</label><input id="marketInterval" type="number" min="1" max="1440" step="1" required></div>
-<div><label for="marketOfferCount">Articles par renouvellement</label><input id="marketOfferCount" type="number" min="1" max="27" step="1" required></div>
+<div><label for="marketInterval">Refresh interval (minutes)</label><input id="marketInterval" type="number" min="1" max="1440" step="1" required></div>
+<div><label for="marketOfferCount">Offers per refresh</label><input id="marketOfferCount" type="number" min="1" max="27" step="1" required></div>
 </div>
-<div class="actions"><button type="submit">Enregistrer les réglages</button><button type="button" class="secondary" id="refreshMarket" disabled>Actualiser le shop sélectionné</button></div>
+<div class="actions"><button type="submit">Save settings</button><button type="button" class="secondary" id="refreshMarket" disabled>Refresh selected player's shop</button></div>
 </form>
-<div id="marketStatus" class="muted" role="status">Chargement des réglages…</div>
+<div id="marketStatus" class="muted" role="status">Loading market settings…</div>
+</section>
+<section><h2>Island Appearance</h2>
+<p class="muted">Turn ground snow on or off on the main island. Changes take effect the next time you launch the game.</p>
+<form id="worldSnowSettings">
+<label class="toggle-row" for="worldSnowEnabled"><input id="worldSnowEnabled" type="checkbox">Ground snow enabled</label>
+<div class="actions"><button type="submit">Save</button></div>
+</form>
+<div id="worldSnowStatus" class="muted" role="status">Loading snow setting…</div>
 </section>
 </main>
 <script>
-const playersEl=document.querySelector("#players"),detailsEl=document.querySelector("#details"),statusEl=document.querySelector("#status"),marketStatusEl=document.querySelector("#marketStatus"),refreshMarketButton=document.querySelector("#refreshMarket");
+const playersEl=document.querySelector("#players"),detailsEl=document.querySelector("#details"),statusEl=document.querySelector("#status"),marketStatusEl=document.querySelector("#marketStatus"),worldSnowStatusEl=document.querySelector("#worldSnowStatus"),refreshMarketButton=document.querySelector("#refreshMarket");
 let selected="";
 function esc(value){return String(value||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
-async function request(url,options){const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw new Error(data.error||"Erreur serveur");return data}
+async function request(url,options){const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw new Error(data.error||"Server error");return data}
 function setStatus(message,error=false){statusEl.textContent=message;statusEl.className=error?"notice error":"muted"}
 function setMarketStatus(message,error=false){marketStatusEl.textContent=message;marketStatusEl.className=error?"notice error":"muted"}
-async function refresh(){setStatus("Chargement…");try{const players=await request("/admin/api/players");playersEl.replaceChildren();if(!players.length){playersEl.innerHTML='<tr><td colspan="3" class="empty">Aucun joueur enregistré.</td></tr>'}
+function setWorldSnowStatus(message,error=false){worldSnowStatusEl.textContent=message;worldSnowStatusEl.className=error?"notice error":"muted"}
+async function refresh(){setStatus("Loading…");try{const players=await request("/admin/api/players");playersEl.replaceChildren();if(!players.length){playersEl.innerHTML='<tr><td colspan="3" class="empty">No players registered.</td></tr>'}
 for(const p of players){const tr=document.createElement("tr");tr.className="player"+(p.uuid===selected?" selected":"");tr.innerHTML="<td>"+esc(p.alias)+"<div class=\"muted\">"+esc(p.uuid)+"</div></td><td>"+esc(p.z2did||"—")+"</td><td>"+p.fragmentCount+"</td>";tr.addEventListener("click",()=>showPlayer(p.uuid));playersEl.append(tr)}
-setStatus(players.length+" joueur(s)");}catch(e){setStatus(e.message,true)}}
-async function loadMarketSettings(){try{const settings=await request("/admin/api/world-market/settings");document.querySelector("#marketInterval").value=settings.refreshIntervalMinutes;document.querySelector("#marketOfferCount").value=settings.offerCount;setMarketStatus("Réglages chargés.")}catch(e){setMarketStatus(e.message,true)}}
+setStatus(players.length+" player(s)");}catch(e){setStatus(e.message,true)}}
+async function loadMarketSettings(){try{const settings=await request("/admin/api/world-market/settings");document.querySelector("#marketInterval").value=settings.refreshIntervalMinutes;document.querySelector("#marketOfferCount").value=settings.offerCount;setMarketStatus("Settings loaded.")}catch(e){setMarketStatus(e.message,true)}}
+async function loadWorldSnowSettings(){try{const settings=await request("/admin/api/game/world-snow");document.querySelector("#worldSnowEnabled").checked=settings.enabled;setWorldSnowStatus("Snow setting loaded.")}catch(e){setWorldSnowStatus(e.message,true)}}
 async function showPlayer(uuid){selected=uuid;refreshMarketButton.disabled=!selected;await refresh();try{const data=await request("/admin/api/players/"+encodeURIComponent(uuid));renderDetails(data.player,data.fragments)}catch(e){detailsEl.textContent=e.message}}
-function renderDetails(p,fragments){detailsEl.innerHTML='<div class="muted">UUID : '+esc(p.uuid)+'</div><div class="notice">'+p.fragmentCount+' fragment(s) · dernière sauvegarde : '+esc(p.lastSavedAt||"indisponible")+'<br>Solde : '+p.nanopods+' nanopods · '+p.gems+' gemmes</div><form id="identity"><label for="alias">Pseudo</label><input id="alias" maxlength="100" required><label for="z2did">Identifiant appareil (z2did)</label><input id="z2did" maxlength="256"><p class="muted">Après réinstallation, le jeu peut créer un compte « Guest ». Notez son z2did dans la liste, arrêtez le jeu, supprimez ce compte provisoire, puis rattachez son z2did à cette sauvegarde.</p><button>Enregistrer le rattachement</button></form><div class="actions"><a class="button secondary" href="/admin/api/players/'+encodeURIComponent(p.uuid)+'/backup">Télécharger la sauvegarde</a><button type="button" class="secondary" id="restore">Restaurer un fichier</button><button type="button" class="danger" id="deletePlayer">Supprimer ce compte</button><input id="backupFile" type="file" accept="application/json,.json" hidden></div><h2 style="margin-top:22px">Fragments enregistrés</h2><ul class="fragments" id="fragmentList"></ul>';
+function renderDetails(p,fragments){detailsEl.innerHTML='<div class="muted">UUID: '+esc(p.uuid)+'</div><div class="notice">'+p.fragmentCount+' fragment(s) · last saved: '+esc(p.lastSavedAt||"unavailable")+'<br>Balance: '+p.nanopods+' nanopods · '+p.gems+' gems</div><form id="identity"><label for="alias">Alias</label><input id="alias" maxlength="100" required><label for="z2did">Device ID (z2did)</label><input id="z2did" maxlength="256"><p class="muted">After reinstalling, the game may create a new "Guest" account. Note its z2did from the list, stop the game, delete the temporary account, then assign its z2did to this save.</p><button>Save player details</button></form><div class="actions"><a class="button secondary" href="/admin/api/players/'+encodeURIComponent(p.uuid)+'/backup">Download save</a><button type="button" class="secondary" id="restore">Restore from file</button><button type="button" class="danger" id="deletePlayer">Delete this account</button><input id="backupFile" type="file" accept="application/json,.json" hidden></div><h2 style="margin-top:22px">Saved fragments</h2><ul class="fragments" id="fragmentList"></ul>';
 document.querySelector("#alias").value=p.alias;document.querySelector("#z2did").value=p.z2did||"";
-const list=document.querySelector("#fragmentList");if(!fragments.length){list.innerHTML="<li>Aucun fragment enregistré.</li>"}else for(const f of fragments){const li=document.createElement("li");li.textContent=f.key+" · "+f.updatedAt;list.append(li)}
-document.querySelector("#identity").addEventListener("submit",async e=>{e.preventDefault();try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({alias:document.querySelector("#alias").value,z2did:document.querySelector("#z2did").value})});setStatus("Joueur mis à jour.");await showPlayer(p.uuid)}catch(error){setStatus(error.message,true)}});
-const skipTutorial=document.createElement("button");skipTutorial.type="button";skipTutorial.className="secondary";skipTutorial.textContent="Débloquer la caméra (sauter le tutoriel)";skipTutorial.addEventListener("click",async()=>{if(!confirm("Arrêtez le jeu et téléchargez d'abord une sauvegarde. Cette action marque comme terminées les dernières missions du tutoriel de plongée pour ce joueur. Continuer ?"))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid)+"/skip-seal-house-tutorial",{method:"POST"});await showPlayer(p.uuid);setStatus("Tutoriel de plongée ignoré. Relancez le jeu pour appliquer le changement.")}catch(error){setStatus(error.message,true)}});document.querySelector(".actions").insertBefore(skipTutorial,document.querySelector("#deletePlayer"));
-const fileInput=document.querySelector("#backupFile");document.querySelector("#restore").addEventListener("click",()=>fileInput.click());fileInput.addEventListener("change",async()=>{if(!fileInput.files.length)return;if(!confirm("La restauration remplacera les données actuelles de ce joueur. Continuer ?")){fileInput.value="";return}try{const backup=JSON.parse(await fileInput.files[0].text());await request("/admin/api/players/"+encodeURIComponent(p.uuid)+"/restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(backup)});setStatus("Sauvegarde restaurée.");await showPlayer(p.uuid)}catch(error){setStatus(error.message,true)}finally{fileInput.value=""}});
-document.querySelector("#deletePlayer").addEventListener("click",async()=>{if(!confirm("Supprimer définitivement "+p.alias+" et tous ses fragments ? Téléchargez une sauvegarde avant de continuer."))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"DELETE"});selected="";refreshMarketButton.disabled=true;detailsEl.textContent="Compte supprimé.";setStatus("Compte et données associés supprimés.");await refresh()}catch(error){setStatus(error.message,true)}});
+const list=document.querySelector("#fragmentList");if(!fragments.length){list.innerHTML="<li>No saved fragments.</li>"}else for(const f of fragments){const li=document.createElement("li");li.textContent=f.key+" · "+f.updatedAt;list.append(li)}
+document.querySelector("#identity").addEventListener("submit",async e=>{e.preventDefault();try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({alias:document.querySelector("#alias").value,z2did:document.querySelector("#z2did").value})});setStatus("Player updated.");await showPlayer(p.uuid)}catch(error){setStatus(error.message,true)}});
+const skipTutorial=document.createElement("button");skipTutorial.type="button";skipTutorial.className="secondary";skipTutorial.textContent="Unlock camera (skip tutorial)";skipTutorial.addEventListener("click",async()=>{if(!confirm("Stop the game and download a backup first. This marks the final diving tutorial missions as complete for this player. Continue?"))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid)+"/skip-seal-house-tutorial",{method:"POST"});await showPlayer(p.uuid);setStatus("Diving tutorial skipped. Restart the game to apply the change.")}catch(error){setStatus(error.message,true)}});document.querySelector(".actions").insertBefore(skipTutorial,document.querySelector("#deletePlayer"));
+const fileInput=document.querySelector("#backupFile");document.querySelector("#restore").addEventListener("click",()=>fileInput.click());fileInput.addEventListener("change",async()=>{if(!fileInput.files.length)return;if(!confirm("Restoring this backup will replace this player's current data. Continue?")){fileInput.value="";return}try{const backup=JSON.parse(await fileInput.files[0].text());await request("/admin/api/players/"+encodeURIComponent(p.uuid)+"/restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(backup)});setStatus("Save restored.");await showPlayer(p.uuid)}catch(error){setStatus(error.message,true)}finally{fileInput.value=""}});
+document.querySelector("#deletePlayer").addEventListener("click",async()=>{if(!confirm("Permanently delete "+p.alias+" and all associated fragments? Download a backup first."))return;try{await request("/admin/api/players/"+encodeURIComponent(p.uuid),{method:"DELETE"});selected="";refreshMarketButton.disabled=true;detailsEl.textContent="Account deleted.";setStatus("Account and associated data deleted.");await refresh()}catch(error){setStatus(error.message,true)}});
 }
-document.querySelector("#marketSettings").addEventListener("submit",async e=>{e.preventDefault();try{const settings={refreshIntervalMinutes:Number(document.querySelector("#marketInterval").value),offerCount:Number(document.querySelector("#marketOfferCount").value)};await request("/admin/api/world-market/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(settings)});setMarketStatus("Réglages enregistrés. Ils s'appliqueront au prochain renouvellement ; actualisez le shop sélectionné pour les appliquer tout de suite.")}catch(error){setMarketStatus(error.message,true)}});
-refreshMarketButton.addEventListener("click",async()=>{if(!selected)return;refreshMarketButton.disabled=true;try{const result=await request("/admin/api/players/"+encodeURIComponent(selected)+"/world-market/refresh",{method:"POST"});setMarketStatus(result.activeSessions>0?"Shop renouvelé et envoyé au client connecté. Si le marché est déjà ouvert, fermez puis rouvrez seulement le marché.":"Shop renouvelé. Aucun client connecté : les offres seront chargées à sa prochaine connexion.")}catch(error){setMarketStatus(error.message,true)}finally{refreshMarketButton.disabled=!selected}});
-document.querySelector("#refresh").addEventListener("click",refresh);refresh();loadMarketSettings();
+document.querySelector("#marketSettings").addEventListener("submit",async e=>{e.preventDefault();try{const settings={refreshIntervalMinutes:Number(document.querySelector("#marketInterval").value),offerCount:Number(document.querySelector("#marketOfferCount").value)};await request("/admin/api/world-market/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(settings)});setMarketStatus("Settings saved. They will take effect at the next refresh. Refresh the selected player's shop to apply them immediately.")}catch(error){setMarketStatus(error.message,true)}});
+document.querySelector("#worldSnowSettings").addEventListener("submit",async e=>{e.preventDefault();const enabled=document.querySelector("#worldSnowEnabled").checked;try{await request("/admin/api/game/world-snow",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});setWorldSnowStatus("Setting saved. Close and relaunch the game to apply the change.")}catch(error){setWorldSnowStatus(error.message,true)}});
+refreshMarketButton.addEventListener("click",async()=>{if(!selected)return;refreshMarketButton.disabled=true;try{const result=await request("/admin/api/players/"+encodeURIComponent(selected)+"/world-market/refresh",{method:"POST"});setMarketStatus(result.activeSessions>0?"Market refreshed and sent to the connected client. If the market is already open, close and reopen only the market.":"Market refreshed. No client is connected; the offers will load at the next login.")}catch(error){setMarketStatus(error.message,true)}finally{refreshMarketButton.disabled=!selected}});
+document.querySelector("#refresh").addEventListener("click",refresh);refresh();loadMarketSettings();loadWorldSnowSettings();
 </script>
 </body>
 </html>`

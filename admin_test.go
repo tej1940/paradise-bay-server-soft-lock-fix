@@ -421,12 +421,12 @@ func TestAdminPanelKeepsSaveManagementVisible(t *testing.T) {
 	}
 
 	html := response.Body.String()
-	saveSection := strings.Index(html, "<section><h2>Sauvegarde sélectionnée</h2>")
-	marketSection := strings.Index(html, "<section><h2>Marché mondial</h2>")
+	saveSection := strings.Index(html, "<section><h2>Selected Player Save</h2>")
+	marketSection := strings.Index(html, "<section><h2>World Market</h2>")
 	if saveSection < 0 || marketSection < 0 || saveSection > marketSection {
 		t.Fatal("save section should appear before the market controls")
 	}
-	if !strings.Contains(html, "Télécharger la sauvegarde") || !strings.Contains(html, "Restaurer un fichier") {
+	if !strings.Contains(html, "Download save") || !strings.Contains(html, "Restore from file") {
 		t.Fatal("admin panel is missing backup or restore controls")
 	}
 }
